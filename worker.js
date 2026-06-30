@@ -1,5 +1,5 @@
-// RTP Indonesia Web Worker Member Access Gateway v1.6.1
-// Update: readable HTML/CSS template + D1 register API
+// RTP Indonesia Web Worker Dashboard Live Engine v2.0.0
+// Update: D1 Dashboard Live Engine + Member Access Gateway
 // Source: v1.5.0 High Impact News Engine + Phase 2 Member Access Gateway
 // Deploy: Cloudflare Workers > Edit code > paste semua isi file ini > Save and Deploy
 // Test API:
@@ -15,6 +15,7 @@
 // - /api/news
 // - /api/news/schema
 // - /api/dashboard
+// - /api/dashboard/status
 // - POST /api/register
 // - /api/register/schema
 
@@ -2363,10 +2364,10 @@ const CONTENT_TYPES = {
 const APP = {
   name: "RTP Indonesia Web Worker",
   brand: "Republik Trader Perintis",
-  version: "1.6.0",
-  codename: "Member Access Gateway",
+  version: "2.0.0",
+  codename: "Dashboard Live Engine",
   timezone: "Asia/Jakarta",
-  buildDate: "2026-06-28",
+  buildDate: "2026-07-01",
   owner: "RTP Indonesia"
 };
 
@@ -2633,6 +2634,193 @@ function newsSchema() {
   };
 }
 
+
+function safeJsonParse(value, fallback = null) {
+  try {
+    return JSON.parse(value);
+  } catch (err) {
+    return fallback;
+  }
+}
+
+function toWibTimeFromAny(value, fallbackTime = nowParts()) {
+  if (!value) return fallbackTime.wibTime;
+  let raw = String(value).trim();
+  let d;
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(raw)) {
+    d = new Date(raw.replace(" ", "T") + "Z");
+  } else {
+    d = new Date(raw);
+  }
+  if (Number.isNaN(d.getTime())) return fallbackTime.wibTime;
+  const wib = new Date(d.toLocaleString("en-US", { timeZone: APP.timezone }));
+  return `${pad2(wib.getHours())}:${pad2(wib.getMinutes())}`;
+}
+
+function normalizeStatusMap(rows = []) {
+  const out = {};
+  for (const row of rows) {
+    const key = String(row.key || "").trim();
+    if (!key) continue;
+    out[key] = row.value;
+    out[key.toLowerCase()] = row.value;
+  }
+  return out;
+}
+
+function pickStatus(map, keys, fallback = null) {
+  for (const key of keys) {
+    if (map[key] !== undefined && map[key] !== null && String(map[key]).trim() !== "") return map[key];
+    const lower = String(key).toLowerCase();
+    if (map[lower] !== undefined && map[lower] !== null && String(map[lower]).trim() !== "") return map[lower];
+  }
+  return fallback;
+}
+
+function d1ActivityToDashboardItem(row, baseTime = nowParts()) {
+  const type = normalizeActivityType(row.type || "SYSTEM");
+  return {
+    id: row.id || crypto.randomUUID(),
+    type,
+    symbol: row.symbol || "RTP",
+    lot: row.lot || null,
+    profit: row.profit || null,
+    title: row.title || type,
+    detail: row.detail || "Dashboard activity",
+    status: row.status || "UPDATE",
+    tone: activityTone(type),
+    timeWIB: toWibTimeFromAny(row.created_at || row.updated_at, baseTime),
+    timestampUTC: row.created_at || row.updated_at || baseTime.utcISO,
+    timestampWIB: row.created_at || row.updated_at || baseTime.wibISO,
+    source: "d1-dashboard-activity"
+  };
+}
+
+async function readDashboardD1(env, baseTime = nowParts(), limit = 10) {
+  const empty = {
+    connected: false,
+    statusRows: [],
+    activityRows: [],
+    activity: [],
+    leadsTotal: null,
+    leadsToday: null,
+    error: null
+  };
+
+  if (!env || !env.DB) {
+    empty.error = "D1 binding DB belum tersedia.";
+    return empty;
+  }
+
+  try {
+    const statusResult = await env.DB.prepare(
+      "SELECT key, value, updated_at FROM dashboard_status ORDER BY key ASC"
+    ).all();
+
+    const activityResult = await env.DB.prepare(
+      "SELECT id, type, title, detail, status, created_at FROM dashboard_activity ORDER BY id DESC LIMIT ?"
+    ).bind(limit).all();
+
+    let leadsTotal = null;
+    let leadsToday = null;
+    try {
+      const totalRow = await env.DB.prepare("SELECT COUNT(*) AS total FROM leads").first();
+      leadsTotal = totalRow ? Number(totalRow.total || 0) : 0;
+      const today = new Date().toISOString().slice(0, 10);
+      const todayRow = await env.DB.prepare("SELECT COUNT(*) AS total FROM leads WHERE substr(created_at, 1, 10) = ?").bind(today).first();
+      leadsToday = todayRow ? Number(todayRow.total || 0) : 0;
+    } catch (err) {
+      // Leads table boleh kosong/belum ada. Dashboard tetap jalan.
+    }
+
+    const statusRows = statusResult?.results || [];
+    const activityRows = activityResult?.results || [];
+
+    return {
+      connected: true,
+      statusRows,
+      activityRows,
+      activity: activityRows.map(row => d1ActivityToDashboardItem(row, baseTime)),
+      leadsTotal,
+      leadsToday,
+      error: null
+    };
+  } catch (err) {
+    return {
+      ...empty,
+      connected: true,
+      error: err.message
+    };
+  }
+}
+
+async function getDashboardPayloadLive(baseTime = nowParts(), path = "/api/dashboard", env) {
+  const payload = getDashboardPayload(baseTime, path);
+  const d1 = await readDashboardD1(env, baseTime, 10);
+  const statusMap = normalizeStatusMap(d1.statusRows);
+
+  payload.meta.version = APP.version;
+  payload.meta.codename = APP.codename;
+  payload.dataMode = d1.connected ? "d1-dashboard-live-engine" : "placeholder-engine";
+  payload.message = d1.error
+    ? `Dashboard Live Engine v2.0.0 aktif, tapi D1 belum lengkap: ${d1.error}`
+    : "Dashboard Live Engine v2.0.0 aktif. Data utama dibaca dari D1: dashboard_status, dashboard_activity, dan leads.";
+
+  const bias = pickStatus(statusMap, ["market_bias", "bias", "dash_bias"], null);
+  const confidence = pickStatus(statusMap, ["market_confidence", "confidence", "dash_confidence"], null);
+  const reason = pickStatus(statusMap, ["market_reason", "reason", "dash_reason"], null);
+  const masterName = pickStatus(statusMap, ["master_name", "copytrade_master"], null);
+  const copyStatus = pickStatus(statusMap, ["copytrade_status", "copy_status"], null);
+  const eaStatus = pickStatus(statusMap, ["ea_status"], null);
+  const totalMembers = pickStatus(statusMap, ["total_members", "community_members"], null);
+  const fundedMax = pickStatus(statusMap, ["funded_max"], null);
+
+  if (bias) {
+    payload.market.bias = String(bias).toUpperCase();
+    payload.market.status = "d1-live";
+  }
+  if (confidence !== null) {
+    const n = Number(confidence);
+    payload.market.confidence = Number.isFinite(n) ? Math.max(0, Math.min(100, n)) : payload.market.confidence;
+  }
+  if (reason) payload.market.reason = String(reason);
+  payload.market.lastUpdateWIB = pickStatus(statusMap, ["last_update_wib", "updated_wib"], baseTime.wibTime);
+
+  if (masterName) payload.stats.masterName = String(masterName);
+  if (copyStatus) payload.stats.copytradeStatus = String(copyStatus);
+  if (eaStatus) payload.stats.eaStatus = String(eaStatus);
+  if (totalMembers) payload.stats.communityMembers = String(totalMembers);
+  if (fundedMax) payload.stats.fundedMax = String(fundedMax);
+
+  payload.performance.todayPercent = pickStatus(statusMap, ["today_percent", "perf_today"], payload.performance.todayPercent);
+  payload.performance.todayUsd = pickStatus(statusMap, ["today_usd", "perf_today_usd"], payload.performance.todayUsd);
+  payload.performance.weekPercent = pickStatus(statusMap, ["week_percent", "perf_week"], payload.performance.weekPercent);
+  payload.performance.weekUsd = pickStatus(statusMap, ["week_usd", "perf_week_usd"], payload.performance.weekUsd);
+  payload.performance.monthPercent = pickStatus(statusMap, ["month_percent", "perf_month"], payload.performance.monthPercent);
+  payload.performance.monthUsd = pickStatus(statusMap, ["month_usd", "perf_month_usd"], payload.performance.monthUsd);
+  payload.performance.maxDrawdown = pickStatus(statusMap, ["max_drawdown", "drawdown"], payload.performance.maxDrawdown);
+  payload.performance.drawdownNote = pickStatus(statusMap, ["drawdown_note"], payload.performance.drawdownNote);
+  const tradingDays = pickStatus(statusMap, ["trading_days"], null);
+  if (tradingDays !== null && Number.isFinite(Number(tradingDays))) payload.performance.tradingDays = Number(tradingDays);
+
+  if (d1.activity.length) payload.activity = d1.activity;
+
+  payload.memberAccess = {
+    leadsTotal: d1.leadsTotal,
+    leadsToday: d1.leadsToday,
+    source: d1.leadsTotal === null ? "leads-table-not-ready" : "d1-leads"
+  };
+
+  payload.dashboardD1 = {
+    connected: d1.connected,
+    statusRows: d1.statusRows.length,
+    activityRows: d1.activityRows.length,
+    error: d1.error
+  };
+
+  return payload;
+}
+
 function getDashboardPayload(baseTime = nowParts(), path = "/api/dashboard") {
   const news = getNewsFeed(baseTime, 5);
   const newsRisk = summarizeNewsRisk(news);
@@ -2706,9 +2894,10 @@ async function handleApi(path, request, env) {
         "/api/activity/schema",
         "/api/news",
         "/api/news/schema",
-        "/api/dashboard"
+        "/api/dashboard",
+        "/api/dashboard/status"
       ],
-      note: "API pondasi v1.6.0. Phase 2 dimulai: Member Access Gateway, register modal, local browser session, dan dashboard unlock untuk member."
+      note: "API pondasi v2.0.0. Dashboard Live Engine membaca D1 dashboard_status, dashboard_activity, dan leads."
     });
   }
 
@@ -2737,7 +2926,7 @@ async function handleApi(path, request, env) {
         version: APP.version,
         codename: APP.codename,
         buildDate: APP.buildDate,
-        previous: "1.4.0",
+        previous: "1.6.1",
         changes: [
           "Menambahkan High Impact News Engine",
           "Menambahkan endpoint /api/news",
@@ -2745,7 +2934,10 @@ async function handleApi(path, request, env) {
           "Menambahkan endpoint agregasi /api/dashboard",
           "Homepage sekarang fetch /api/dashboard agar lebih hemat request",
           "AI Market Bias otomatis turun ke WAIT saat news berisiko",
-          "Menyiapkan pondasi news cron / KV / Wrangler module"
+          "Menyiapkan pondasi news cron / KV / Wrangler module",
+          "v2.0.0: Dashboard Live Engine membaca D1 dashboard_status",
+          "v2.0.0: Aktivitas dashboard membaca D1 dashboard_activity",
+          "v2.0.0: Endpoint /api/dashboard/status untuk test D1"
         ]
       }
     });
@@ -2943,13 +3135,37 @@ async function handleApi(path, request, env) {
     });
   }
 
+  if (path === "/api/dashboard/status") {
+    const d1 = await readDashboardD1(env, t, 20);
+    return jsonResponse({
+      ok: !d1.error,
+      meta: apiMeta(path),
+      dataMode: "d1-dashboard-live-engine",
+      message: d1.error ? `D1 dashboard belum lengkap: ${d1.error}` : "D1 dashboard status berhasil dibaca.",
+      d1: {
+        connected: d1.connected,
+        statusRows: d1.statusRows.length,
+        activityRows: d1.activityRows.length,
+        leadsTotal: d1.leadsTotal,
+        leadsToday: d1.leadsToday,
+        error: d1.error
+      },
+      engines: d1.statusRows.map(row => ({
+        key: row.key,
+        value: row.value,
+        updatedAt: row.updated_at
+      })),
+      activity: d1.activity
+    });
+  }
+
   if (path === "/api/dashboard") {
-    return jsonResponse(getDashboardPayload(t, path));
+    return jsonResponse(await getDashboardPayloadLive(t, path, env));
   }
 
   if (path === "/api/live") {
-    const payload = getDashboardPayload(t, path);
-    payload.message = "Legacy alias v1.6.0. /api/live tetap hidup, tapi sumber utama homepage sekarang /api/dashboard dan UI dikunci Member Access Gateway.";
+    const payload = await getDashboardPayloadLive(t, path, env);
+    payload.message = "Legacy alias v2.0.0. /api/live tetap hidup, tapi sumber utama homepage sekarang /api/dashboard dan UI dikunci Member Access Gateway.";
     return jsonResponse(payload);
   }
 
@@ -2974,7 +3190,7 @@ async function handleApi(path, request, env) {
     ok: false,
     error: "API endpoint not found",
     meta: apiMeta(path),
-    availableEndpoints: ["/api/health", "/api/version", "/api/server-time", "/api/market", "/api/stats", "/api/live", "/api/feed", "/api/activity", "/api/activity/schema", "/api/news", "/api/news/schema", "/api/dashboard"]
+    availableEndpoints: ["/api/health", "/api/version", "/api/server-time", "/api/market", "/api/stats", "/api/live", "/api/feed", "/api/activity", "/api/activity/schema", "/api/news", "/api/news/schema", "/api/dashboard", "/api/dashboard/status"]
   }, 404);
 }
 
